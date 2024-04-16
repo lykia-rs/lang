@@ -1,25 +1,26 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
 use std::collections::HashMap;
+use std::mem;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
-use super::block::Block;
-use super::compact::{
+use crate::storage::block::Block;
+use crate::storage::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
-use super::lsm_iterator::{FusedIterator, LsmIterator};
-use super::manifest::Manifest;
-use super::mem_table::MemTable;
-use super::mvcc::LsmMvccInner;
-use super::table::SsTable;
+use crate::storage::lsm_iterator::{FusedIterator, LsmIterator};
+use crate::storage::manifest::Manifest;
+use crate::storage::mem_table::MemTable;
+use crate::storage::mvcc::LsmMvccInner;
+use crate::storage::table::SsTable;
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -279,7 +280,29 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+            // We drop the global lock here
+        };
+        
+        if let Some(val) = snapshot.memtable.get(_key) {
+            if val.is_empty() {
+                // Means the key is deleted
+                return Ok(None);
+            }
+            return Ok(Some(val));
+        }
+        for imm in snapshot.imm_memtables.iter() {
+            if let Some(val) = imm.get(_key) {
+                if val.is_empty() {
+                    // Means the key is deleted
+                    return Ok(None);
+                }
+                return Ok(Some(val));
+            }
+        };
+        return Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -287,14 +310,33 @@ impl LsmStorageInner {
         unimplemented!()
     }
 
+    pub fn check_freeze(&self, approximate_size: usize) -> Result<()> {
+        if approximate_size >= self.options.target_sst_size {
+            let state_lock = self.state_lock.lock();
+            let read_guard = self.state.read();
+            if read_guard.memtable.approximate_size() >= self.options.target_sst_size {
+                // Checking it once again, as multiple threads may have reached to this point
+                drop(read_guard);
+                self.force_freeze_memtable(&state_lock)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+        let read_guard = self.state.read();
+        read_guard.memtable.put(_key, _value)?;
+        let total = read_guard.memtable.approximate_size();
+        drop(read_guard);
+        self.check_freeze(total)?;
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+        self.put(_key,&[0_u8; 0])?;
+        Ok(())
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -318,8 +360,15 @@ impl LsmStorageInner {
     }
 
     /// Force freeze the current memtable to an immutable memtable
-    pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+    pub fn force_freeze_memtable(&self, _state_lock_guard: &MutexGuard<'_, ()>) -> Result<()> {
+        let mut state = self.state.write();
+        let mut clone = state.as_ref().clone();
+        let new_memtable = Arc::new(MemTable::create(self.next_sst_id()));
+        let frozen = mem::replace(&mut clone.memtable, new_memtable);
+        clone.imm_memtables.insert(0, frozen);
+        *state = Arc::new(clone);
+        drop(state);
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk

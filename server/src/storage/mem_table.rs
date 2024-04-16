@@ -10,10 +10,10 @@ use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
 
-use super::iterators::StorageIterator;
-use super::key::KeySlice;
-use super::table::SsTableBuilder;
-use super::wal::Wal;
+use crate::storage::iterators::StorageIterator;
+use crate::storage::key::KeySlice;
+use crate::storage::table::SsTableBuilder;
+use crate::storage::wal::Wal;
 
 /// A basic mem-table based on crossbeam-skiplist.
 ///
@@ -38,7 +38,12 @@ pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
 impl MemTable {
     /// Create a new mem-table.
     pub fn create(_id: usize) -> Self {
-        unimplemented!()
+        MemTable {
+            map: Arc::new(SkipMap::new()),
+            wal: None,
+            id: _id,
+            approximate_size: Arc::new(AtomicUsize::new(0))
+        }
     }
 
     /// Create a new mem-table with WAL
@@ -69,7 +74,7 @@ impl MemTable {
 
     /// Get a value by key.
     pub fn get(&self, _key: &[u8]) -> Option<Bytes> {
-        unimplemented!()
+        self.map.get(_key).map(|v| v.value().clone())
     }
 
     /// Put a key-value pair into the mem-table.
@@ -77,7 +82,11 @@ impl MemTable {
     /// In week 1, day 1, simply put the key-value pair into the skipmap.
     /// In week 2, day 6, also flush the data to WAL.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+        let key_as_bytes = Bytes::copy_from_slice(_key);
+        let value_as_bytes = Bytes::copy_from_slice(_value);
+        self.approximate_size.fetch_add(key_as_bytes.len() + value_as_bytes.len(), std::sync::atomic::Ordering::Relaxed);
+        self.map.insert(key_as_bytes, value_as_bytes);
+        Ok(())
     }
 
     pub fn sync_wal(&self) -> Result<()> {
