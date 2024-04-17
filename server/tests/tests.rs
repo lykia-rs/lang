@@ -2,3 +2,4 @@
 
 mod lang;
 mod runtime;
+// mod storage; // TODO(vck): Will be enabled once the integration tests are ready
